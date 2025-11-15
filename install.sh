@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Minimal bootstrapper that installs the pinned toolchain using uv.
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PYTHON_VERSION="3.12.11"
+UV_INSTALLER_URL="https://astral.sh/uv/install.sh"
+
+export PATH="$HOME/.local/bin:$PATH"
+
+if ! command -v uv >/dev/null 2>&1; then
+  echo "uv not found; installing from ${UV_INSTALLER_URL}..."
+  curl -LsSf "${UV_INSTALLER_URL}" | sh
+  hash -r
+fi
+
+cd "${PROJECT_ROOT}"
+
+if ! uv python list --only-installed | grep -q "${PYTHON_VERSION}"; then
+  echo "Installing Python ${PYTHON_VERSION} via uv..."
+  uv python install "${PYTHON_VERSION}"
+fi
+
+uv venv
+uv pip install -e . --torch-backend=auto -p .venv/bin/python
+
+echo "Environment ready. Activate it with 'source .venv/bin/activate' and log into wandb before training."

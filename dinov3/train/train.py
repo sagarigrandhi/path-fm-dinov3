@@ -11,11 +11,15 @@ import math
 import os
 import sys
 from functools import partial
+from io import BytesIO
 from pathlib import Path
 
 import torch
 import torch.distributed
+from datasets import load_dataset
+from PIL import Image, ImageOps
 from torch.distributed._tensor import DTensor
+from omegaconf import OmegaConf
 
 import dinov3.distributed as distributed
 from dinov3.checkpointer import (
@@ -45,6 +49,7 @@ torch.backends.cuda.matmul.allow_tf32 = True  # pytorch 1.12 sets this to false 
 torch.backends.cudnn.benchmark = False  # True
 
 logger = logging.getLogger("dinov3")
+CONFIG_FILE_PATH: str | None = None
 
 
 def get_args_parser(add_help: bool = True):
@@ -236,6 +241,134 @@ def apply_optim_scheduler(optimizer, lr, wd, last_layer_lr):
             param_group["lr"] = lr * lr_multiplier
 
 
+def _build_streaming_dataset(
+    dataset_path: str,
+    *,
+    split: str,
+    shuffle_buffer: int,
+    base_seed: int,
+    epoch: int = 0,
+):
+    import pyarrow.dataset
+
+    if not dataset_path:
+        raise ValueError("cfg.train.streaming_dataset.path must be provided for hf_streaming backend.")
+
+    world_size = distributed.get_world_size() if distributed.is_enabled() else 1
+    global_rank = distributed.get_rank() if distributed.is_enabled() else 0
+
+    load_kwargs = dict(streaming=True)
+    fragment_scan_options = pyarrow.dataset.ParquetFragmentScanOptions(
+        cache_options=pyarrow.CacheOptions(
+            prefetch_limit=4,
+            range_size_limit=(32 << 20),
+        ),
+    )
+    load_kwargs["fragment_scan_options"] = fragment_scan_options
+
+    dataset = load_dataset(dataset_path, split=split, **load_kwargs)
+
+    if world_size > 1:
+        dataset = dataset.shard(num_shards=world_size, index=global_rank)
+
+    seed = base_seed + epoch * 1_000_000 + global_rank * 10_000
+    dataset = dataset.shuffle(buffer_size=shuffle_buffer, seed=seed)
+    return dataset
+
+
+class _TransformedStreamingDataset(torch.utils.data.IterableDataset):
+    def __init__(self, dataset_builder, transform, samples_per_epoch, reshuffle_every):
+        super().__init__()
+        self._dataset_builder = dataset_builder
+        self._transform = transform
+        self._samples_per_epoch = samples_per_epoch
+        self._reshuffle_every = reshuffle_every
+        self._initialized = False
+        self._epoch_seen = 0
+        self._src_iter = None
+
+    def _init_or_reshuffle(self, force=False):
+        if force or (not self._initialized) or (
+            self._reshuffle_every and (self._epoch_seen % self._reshuffle_every == 0)
+        ):
+            src = self._dataset_builder(epoch=self._epoch_seen if self._reshuffle_every else 0)
+            worker_info = torch.utils.data.get_worker_info()
+            if worker_info is not None and worker_info.num_workers > 1:
+                src = src.shard(num_shards=worker_info.num_workers, index=worker_info.id)
+            self._src_iter = iter(src)
+            self._initialized = True
+
+    def __iter__(self):
+        while True:
+            self._init_or_reshuffle()
+            rank_quota = self._samples_per_epoch or (1 << 62)
+
+            worker_info = torch.utils.data.get_worker_info()
+            num_workers = worker_info.num_workers if worker_info is not None else 1
+            worker_id = worker_info.id if worker_info is not None else 0
+
+            base = rank_quota // num_workers
+            remainder = rank_quota % num_workers
+            local_quota = base + (1 if worker_id < remainder else 0)
+
+            produced = 0
+            while produced < local_quota:
+                try:
+                    sample = next(self._src_iter)
+                except StopIteration:
+                    self._init_or_reshuffle(force=True)
+                    continue
+                yield self._transform(sample)
+                produced += 1
+
+            self._epoch_seen += 1
+
+
+def _streaming_worker_init(_):
+    torch.set_num_threads(1)
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+
+
+def build_streaming_data_loader(cfg, data_transform, collate_fn):
+    dataset_builder = partial(
+        _build_streaming_dataset,
+        dataset_path=cfg.train.streaming_dataset.path,
+        split=cfg.train.streaming_dataset.split,
+        shuffle_buffer=cfg.train.streaming_dataset.shuffle_buffer,
+        base_seed=cfg.train.streaming_dataset.base_seed,
+    )
+
+    def decode_and_transform(item):
+        image = Image.open(BytesIO(item["image_bytes"]))
+        image = ImageOps.exif_transpose(image).convert("RGB")
+        transformed = data_transform(image)
+        return transformed, None
+
+    samples_per_epoch = cfg.train.streaming_dataset.samples_per_epoch
+    if samples_per_epoch in (None, 0):
+        samples_per_epoch = cfg.train.batch_size_per_gpu * cfg.train.OFFICIAL_EPOCH_LENGTH
+
+    streaming_dataset = _TransformedStreamingDataset(
+        dataset_builder,
+        decode_and_transform,
+        samples_per_epoch=samples_per_epoch,
+        reshuffle_every=cfg.train.streaming_dataset.reshuffle_every,
+    )
+
+    dataloader_kwargs = dict(
+        dataset=streaming_dataset,
+        batch_size=cfg.train.batch_size_per_gpu,
+        num_workers=cfg.train.num_workers,
+        drop_last=True,
+        pin_memory=True,
+        persistent_workers=cfg.train.num_workers > 0,
+        collate_fn=collate_fn,
+        worker_init_fn=_streaming_worker_init,
+    )
+
+    return torch.utils.data.DataLoader(**dataloader_kwargs)
+
+
 def do_test(cfg, model, iteration, process_group, do_low_freq=False):
     # dump a sharded checkpoint
     eval_dir = Path(cfg.train.output_dir) / "eval" / str(iteration)
@@ -306,9 +439,18 @@ def build_data_loader_from_cfg(
     batch_size = dataloader_batch_size_per_gpu
     num_workers = cfg.train.num_workers
     dataset_path = cfg.train.dataset_path
+    data_transform = model.build_data_augmentation_dino(cfg)
+
+    if cfg.train.streaming_from_hf:
+        return build_streaming_data_loader(
+            cfg=cfg,
+            data_transform=data_transform,
+            collate_fn=collate_fn,
+        )
+
     dataset = make_dataset(
         dataset_str=dataset_path,
-        transform=model.build_data_augmentation_dino(cfg),
+        transform=data_transform,
         target_transform=lambda _: (),
     )
 
@@ -385,7 +527,6 @@ def do_train(cfg, model, resume=False):
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     model.train()
-    # Optimizer
     optimizer = build_optimizer(cfg, model.get_params_groups())
     (
         lr_schedule,
@@ -415,169 +556,218 @@ def do_train(cfg, model, resume=False):
         )
     OFFICIAL_EPOCH_LENGTH = cfg.train.OFFICIAL_EPOCH_LENGTH
     max_iter = cfg.optim.epochs * OFFICIAL_EPOCH_LENGTH
+    early_stop_epochs = getattr(cfg.optim, "early_stop", -1)
+    if early_stop_epochs is not None and early_stop_epochs > 0:
+        stop_iter = min(max_iter, early_stop_epochs * OFFICIAL_EPOCH_LENGTH)
+    else:
+        stop_iter = max_iter
+
     if cfg.multidistillation.enabled:
         global_batch_size = cfg.multidistillation.global_batch_size
     else:
         global_batch_size = cfg.train.batch_size_per_gpu * distributed.get_world_size()
 
-    # Build data loader
-    data_loader = build_multi_resolution_data_loader_from_cfg(
-        cfg=cfg,
-        model=model,
-        start_iter=start_iter,
-    )
+    wandb_module = None
+    wandb_run = None
+    if cfg.logging.use_wandb:
+        import wandb as _wandb
 
-    # Metric logging
-    logger.info("Starting training from iteration %d", start_iter)
-    metrics_file = os.path.join(cfg.train.output_dir, "training_metrics.json")
-    metric_logger = MetricLogger(delimiter="  ", output_file=metrics_file)
-    # Manual garbage collection
-    gc.disable()
-    gc.collect()
+        wandb_module = _wandb
+        if distributed.is_main_process():
+            run_id_path = Path(cfg.train.output_dir) / "wandb_run_id.txt"
+            run_id_path.parent.mkdir(parents=True, exist_ok=True)
+            if resume and run_id_path.exists():
+                run_id = run_id_path.read_text().strip()
+                resume_mode = "must"
+            else:
+                run_id = wandb_module.util.generate_id()
+                resume_mode = "allow"
+                run_id_path.write_text(run_id)
+            wandb_run = wandb_module.init(
+                project=cfg.logging.project or None,
+                entity=cfg.logging.entity or None,
+                group=cfg.logging.group or None,
+                job_type=cfg.logging.job_type or None,
+                name=cfg.logging.run_name or None,
+                config=OmegaConf.to_container(cfg, resolve=True),
+                id=run_id,
+                resume=resume_mode,
+                tags=list(cfg.logging.tags) if cfg.logging.tags else None,
+            )
+            if cfg.logging.artifact_logging:
+                artifact = wandb_module.Artifact(name=f"run-source-{wandb_run.id}", type="code")
+                artifact.add_file(Path(__file__).resolve())
+                run_script = os.environ.get("DINOV3_RUN_SCRIPT")
+                if run_script and os.path.exists(run_script):
+                    artifact.add_file(run_script)
+                if CONFIG_FILE_PATH and os.path.exists(CONFIG_FILE_PATH):
+                    artifact.add_file(CONFIG_FILE_PATH)
+                wandb_run.log_artifact(artifact)
 
-    # Training loop
-    student = model.student
-    iteration = start_iter
-    num_gram_updates = 0
-    if (
-        cfg.gram.use_loss
-        and model.has_gram_teacher
-        and cfg.gram.rep_update
-        and start_iter > 0
-        and start_iter >= cfg.gram.it_first_update
-    ):
-        # If `start_iter == it_first_update`, we have performed one gram teacher update after
-        # iteration `start_iter - 1`, except if we are starting training from scratch and `start_iter == 0`.
-        num_gram_updates = math.ceil((start_iter + 1 - cfg.gram.it_first_update) / cfg.gram.update_frequency)
-        logger.info(f"Gram was updated {num_gram_updates} times before iteration {start_iter}")
-    consecutive_nan_count = 0
-    for data in metric_logger.log_every(
-        data_loader,
-        print_freq=10,
-        header="Training",
-        n_iterations=max_iter,
-        start_iteration=start_iter,
-    ):
-        it = iteration
-        data["global_batch_size"] = global_batch_size
-        if iteration > max_iter:
-            return
-
-        # Garbage collection (trigger manually so it happens on all ranks at the same time)
-        if (iteration + 1) % 150 == 0:
-            logger.info("Garbage collection")
-            gc.collect()
-
-        if cfg.gram.use_loss and model.gram_it_load_ema_teacher == it:
-            logger.info(f"Loading EMA teacher into Gram teacher before iteration {it}")
-            model.gram_load_ema_teacher()
-
-        # Learning rates and other schedules
-        lr = lr_schedule[it]
-        wd = wd_schedule[it]
-        mom = momentum_schedule[it]
-        teacher_temp = teacher_temp_schedule[it]
-        last_layer_lr = last_layer_lr_schedule[it]
-        apply_optim_scheduler(optimizer, lr, wd, last_layer_lr)
-
-        # Forward backward
-        optimizer.zero_grad(set_to_none=True)
-        total_loss, metrics_dict = model.forward_backward(data, teacher_temp=teacher_temp, iteration=it)
-
-        # Gradient clipping
-        if cfg.optim.clip_grad:
-            for k, v in student.items():
-                grad_norm = torch.nn.utils.clip_grad_norm_(
-                    v.parameters(),
-                    max_norm=cfg.optim.clip_grad,
-                )
-                metrics_dict[f"{k}_grad_norm"] = (
-                    grad_norm.full_tensor().item()
-                    if isinstance(grad_norm, torch.distributed.tensor.DTensor)
-                    else grad_norm.item()
-                )
-
-        # Reduce total_loss to check for NaNs, reduce metrics for logging
-        total_loss_all_ranks = total_loss.new_empty(distributed.get_subgroup_size())
-        torch.distributed.all_gather_into_tensor(
-            total_loss_all_ranks,
-            total_loss.detach(),
-            group=distributed.get_process_subgroup(),
+    try:
+        data_loader = build_multi_resolution_data_loader_from_cfg(
+            cfg=cfg,
+            model=model,
+            start_iter=start_iter,
         )
-        total_loss = total_loss_all_ranks.mean()
-        metrics_values = torch.stack(
-            [torch.as_tensor(v, dtype=torch.float32, device=total_loss.device).detach() for v in metrics_dict.values()]
-        )
-        torch.distributed.all_reduce(
-            metrics_values,
-            op=torch.distributed.ReduceOp.AVG,
-            group=distributed.get_process_subgroup(),
-        )
-        metrics_dict = dict(zip(metrics_dict.keys(), metrics_values))
-        if total_loss_all_ranks.isnan().any():
-            consecutive_nan_count += 1
-            which_ranks = total_loss_all_ranks.isnan().nonzero().flatten().tolist()
-            logger.warning("NaN loss detected on ranks: %s", which_ranks)
-            logger.warning("Consecutive NaNs: %d", consecutive_nan_count)
-            metrics_dict_str = "\n".join([f"{k}: {v}" for k, v in metrics_dict.items()])
-            logger.warning("All-reduced metrics:\n%s", metrics_dict_str)
-            if consecutive_nan_count > 2 and not cfg.multidistillation.enabled:
-                msg = "Too many consecutive nans detected in loss, aborting..."
-                logger.error(msg)
-                raise RuntimeError(msg)
-        else:
-            consecutive_nan_count = 0
-        # Step optimizer
-        optimizer.step()
-        model.update_ema(mom)
 
-        # [GRAM] Update gram teacher when using gram teacher and frequent updates
+        logger.info("Starting training from iteration %d", start_iter)
+        metrics_file = os.path.join(cfg.train.output_dir, "training_metrics.json")
+        metric_logger = MetricLogger(delimiter="  ", output_file=metrics_file)
+        gc.disable()
+        gc.collect()
+
+        student = model.student
+        iteration = start_iter
+        num_gram_updates = 0
         if (
             cfg.gram.use_loss
-            and model.gram_rep_update
-            and (it + 1) >= model.gram_it_first_update
-            and (it + 1) % model.gram_update_frequency == 0
-            and (cfg.gram.max_updates is None or num_gram_updates < cfg.gram.max_updates)
+            and model.has_gram_teacher
+            and cfg.gram.rep_update
+            and start_iter > 0
+            and start_iter >= cfg.gram.it_first_update
         ):
-            logger.info(f"Updating Gram teacher from EMA teacher after iteration {it}")
-            model.update_gram()
-            num_gram_updates += 1
-
-        # Log metrics
-        metric_logger.update(lr=lr)
-        metric_logger.update(wd=wd)
-        metric_logger.update(mom=mom)
-        metric_logger.update(last_layer_lr=last_layer_lr)
-        metric_logger.update(total_loss=total_loss, **metrics_dict)
-
-        # Submit evaluation jobs
-        if (
-            cfg.evaluation.eval_period_iterations > 0 and (iteration + 1) % cfg.evaluation.eval_period_iterations == 0
-            # and iteration != max_iter - 1
+            num_gram_updates = math.ceil((start_iter + 1 - cfg.gram.it_first_update) / cfg.gram.update_frequency)
+            logger.info(f"Gram was updated {num_gram_updates} times before iteration {start_iter}")
+        consecutive_nan_count = 0
+        for data in metric_logger.log_every(
+            data_loader,
+            print_freq=10,
+            header="Training",
+            n_iterations=stop_iter,
+            start_iteration=start_iter,
         ):
-            do_test(cfg, model, f"training_{iteration}", process_group=process_subgroup)
-            torch.cuda.synchronize()
+            if iteration >= stop_iter:
+                logger.info("Reached target iteration %d/%d; stopping training loop.", iteration, stop_iter)
+                break
 
-        # Checkpointing
-        if (iteration + 1) % cfg.checkpointing.period == 0:
-            torch.cuda.synchronize()
-            save_checkpoint(
-                ckpt_dir / str(iteration),
-                iteration=iteration,
-                model=model,
-                optimizer=optimizer,
-                overwrite=True,
-                process_group=process_subgroup,
+            it = iteration
+            data["global_batch_size"] = global_batch_size
+
+            if (iteration + 1) % 150 == 0:
+                logger.info("Garbage collection")
+                gc.collect()
+
+            if cfg.gram.use_loss and model.gram_it_load_ema_teacher == it:
+                logger.info(f"Loading EMA teacher into Gram teacher before iteration {it}")
+                model.gram_load_ema_teacher()
+
+            lr = lr_schedule[it]
+            wd = wd_schedule[it]
+            mom = momentum_schedule[it]
+            teacher_temp = teacher_temp_schedule[it]
+            last_layer_lr = last_layer_lr_schedule[it]
+            apply_optim_scheduler(optimizer, lr, wd, last_layer_lr)
+
+            optimizer.zero_grad(set_to_none=True)
+            total_loss, metrics_dict = model.forward_backward(data, teacher_temp=teacher_temp, iteration=it)
+
+            if cfg.optim.clip_grad:
+                for k, v in student.items():
+                    grad_norm = torch.nn.utils.clip_grad_norm_(v.parameters(), max_norm=cfg.optim.clip_grad)
+                    metrics_dict[f"{k}_grad_norm"] = (
+                        grad_norm.full_tensor().item()
+                        if isinstance(grad_norm, torch.distributed.tensor.DTensor)
+                        else grad_norm.item()
+                    )
+
+            total_loss_all_ranks = total_loss.new_empty(distributed.get_subgroup_size())
+            torch.distributed.all_gather_into_tensor(
+                total_loss_all_ranks,
+                total_loss.detach(),
+                group=distributed.get_process_subgroup(),
             )
-            if distributed.is_subgroup_main_process():
-                keep_last_n_checkpoints(ckpt_dir, cfg.checkpointing.max_to_keep)
-                if "keep_every" in cfg.checkpointing and (iteration + 1) % cfg.checkpointing.keep_every == 0:
-                    keep_checkpoint_copy(ckpt_dir / str(iteration))
+            total_loss = total_loss_all_ranks.mean()
+            metrics_values = torch.stack(
+                [torch.as_tensor(v, dtype=torch.float32, device=total_loss.device).detach() for v in metrics_dict.values()]
+            )
+            torch.distributed.all_reduce(
+                metrics_values,
+                op=torch.distributed.ReduceOp.AVG,
+                group=distributed.get_process_subgroup(),
+            )
+            metrics_dict = dict(zip(metrics_dict.keys(), metrics_values))
+            if total_loss_all_ranks.isnan().any():
+                consecutive_nan_count += 1
+                which_ranks = total_loss_all_ranks.isnan().nonzero().flatten().tolist()
+                logger.warning("NaN loss detected on ranks: %s", which_ranks)
+                logger.warning("Consecutive NaNs: %d", consecutive_nan_count)
+                metrics_dict_str = "\n".join([f"{k}: {v}" for k, v in metrics_dict.items()])
+                logger.warning("All-reduced metrics:\n%s", metrics_dict_str)
+                if consecutive_nan_count > 2 and not cfg.multidistillation.enabled:
+                    msg = "Too many consecutive nans detected in loss, aborting..."
+                    logger.error(msg)
+                    raise RuntimeError(msg)
+            else:
+                consecutive_nan_count = 0
 
-        iteration = iteration + 1
-    metric_logger.synchronize_between_processes()
+            optimizer.step()
+            model.update_ema(mom)
 
-    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+            if (
+                cfg.gram.use_loss
+                and model.gram_rep_update
+                and (it + 1) >= model.gram_it_first_update
+                and (it + 1) % model.gram_update_frequency == 0
+                and (cfg.gram.max_updates is None or num_gram_updates < cfg.gram.max_updates)
+            ):
+                logger.info(f"Updating Gram teacher from EMA teacher after iteration {it}")
+                model.update_gram()
+                num_gram_updates += 1
+
+            metric_logger.update(lr=lr)
+            metric_logger.update(wd=wd)
+            metric_logger.update(mom=mom)
+            metric_logger.update(last_layer_lr=last_layer_lr)
+            metric_logger.update(total_loss=total_loss, **metrics_dict)
+
+            if wandb_run is not None and wandb_module is not None and distributed.is_main_process():
+                wandb_log = {
+                    "lr": lr,
+                    "momentum": mom,
+                    "weight_decay": wd,
+                    "last_layer_lr": last_layer_lr,
+                    "total_loss": total_loss.item(),
+                    "iteration": iteration,
+                }
+                for key, value in metrics_dict.items():
+                    wandb_log[f"train/{key}"] = value.item() if isinstance(value, torch.Tensor) else float(value)
+                wandb_module.log(wandb_log, step=iteration)
+
+            if (
+                cfg.evaluation.eval_period_iterations > 0
+                and (iteration + 1) % cfg.evaluation.eval_period_iterations == 0
+            ):
+                do_test(cfg, model, f"training_{iteration}", process_group=process_subgroup)
+                torch.cuda.synchronize()
+
+            if (iteration + 1) % cfg.checkpointing.period == 0:
+                torch.cuda.synchronize()
+                save_checkpoint(
+                    ckpt_dir / str(iteration),
+                    iteration=iteration,
+                    model=model,
+                    optimizer=optimizer,
+                    overwrite=True,
+                    process_group=process_subgroup,
+                )
+                if distributed.is_subgroup_main_process():
+                    keep_last_n_checkpoints(ckpt_dir, cfg.checkpointing.max_to_keep)
+                    if "keep_every" in cfg.checkpointing and (iteration + 1) % cfg.checkpointing.keep_every == 0:
+                        keep_checkpoint_copy(ckpt_dir / str(iteration))
+
+            iteration = iteration + 1
+
+        metric_logger.synchronize_between_processes()
+        if stop_iter < max_iter and iteration >= stop_iter and cfg.evaluation.eval_period_iterations >= 0:
+            logger.info("Early stopping triggered at iteration %d (limit %d).", iteration, stop_iter)
+            do_test(cfg, model, f"earlystop_{iteration}", process_group=process_subgroup)
+            torch.cuda.synchronize()
+
+        return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+    finally:
+        if wandb_run is not None and distributed.is_main_process():
+            wandb_run.finish()
 
 
 def main(argv=None):
@@ -586,6 +776,8 @@ def main(argv=None):
     else:
         args = get_args_parser().parse_args(argv[1:])
         args.output_dir = sys.argv[1]
+    global CONFIG_FILE_PATH
+    CONFIG_FILE_PATH = os.path.abspath(args.config_file) if args.config_file else None
     if args.multi_distillation:
         print("performing multidistillation run")
         cfg = setup_multidistillation(args)

@@ -1,0 +1,61 @@
+dino:
+  head_n_prototypes: 262144
+  head_bottleneck_dim: 512
+  head_hidden_dim: 8192
+  kde_loss_weight: 0.05 
+  koleo_loss_weight: 0.0 # 0 = no Ko Leo regularization
+ibot:
+  separate_head: true
+  head_n_prototypes: 98304
+  head_bottleneck_dim: 384
+  head_hidden_dim: 4096
+gram:
+  use_loss: false # (bool) if true gram is used, else not
+train:
+  batch_size_per_gpu: 48
+  num_workers: 4
+  OFFICIAL_EPOCH_LENGTH: 1250
+  centering: sinkhorn_knopp
+  cache_dataset: true
+  streaming_from_hf: false
+  streaming_dataset:
+    path: /data/TCGA_parquet_sample30_shuffled
+    shuffle_buffer: 50000
+    base_seed: 42
+  dataset_path: "pathology:root=/data/TCGA/" # only used if streaming_from_hf is false
+student: # see vit_huge2 in dinov3/models/vision_transformer.py
+  arch: vit_huge2
+  patch_size: 16
+  drop_path_rate: 0.4
+  layerscale: 1.0e-05
+  qkv_bias: true
+  proj_bias: true
+  ffn_bias: true
+  ffn_layer: swiglu
+  ffn_ratio: 6.0
+  norm_layer: layernormbf16
+  n_storage_tokens: 4
+  mask_k_bias: true
+  pos_embed_rope_base: 100.0
+  pos_embed_rope_normalize_coords: separate
+  pos_embed_rope_rescale_coords: 2.0
+  pos_embed_rope_dtype: fp32
+  resume_from_teacher_chkpt: ./checkpoints/dinov3_vith16plus_saved_teacher.pth
+optim:
+  epochs: 40 # 1000
+  early_stop: 9999
+  lr: 0.001 # .0002
+  weight_decay_end: 0.2
+  warmup_epochs: 10
+  clip_grad: 30.0
+  layerwise_decay: 0.98
+crops:
+  use_pathology_hed: true
+evaluation:
+  eval_period_iterations: 12500
+checkpointing:
+  period: 1000
+  keep_every: 10000
+logging:
+  use_wandb: true
+  project: path-fm-dinov3
