@@ -10,12 +10,13 @@ export CUDA_VISIBLE_DEVICES="0,1,2,3,4,5,6,7"
 export NODE_RANK=0
 
 CONFIG_FILE="./dinov3/configs/train/vith16plus_8gpus.yaml"
-OUTPUT_DIR="/data/path-fm-dinov3/output_vith16plus_8gpu"
+OUTPUT_DIR="./output_vith16plus_8gpu"
 RESUME="True"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 export DINOV3_RUN_SCRIPT="${REPO_ROOT}/$(basename "${BASH_SOURCE[0]}")"
 export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+export PATH="$HOME/.local/bin:$PATH"
 
 if [[ "${RESUME}" == "True" ]]; then
   echo "Resume enabled; preserving ${OUTPUT_DIR}"

@@ -12,15 +12,15 @@ ibot:
 gram:
   use_loss: false # (bool) if true gram is used, else not
 train:
-  batch_size_per_gpu: 44 # 44 seems max for 1-gpu, 56 works on full H100 node
+  batch_size_per_gpu: 56 # 44 seems max for 1-gpu, 56 can work on full H100 node
   num_workers: 4
   OFFICIAL_EPOCH_LENGTH: 1250
   centering: sinkhorn_knopp
   eval_and_ckpt_at_step0: true
   cache_dataset: true
-  streaming_from_hf: true
+  streaming_from_hf: false
   streaming_dataset:
-    path: medarc/TCGA-12K-parquet-shuffled
+    path: /data/TCGA_parquet_sample30_shuffled
     shuffle_buffer: 50000
     base_seed: 42
   dataset_path: "pathology:root=/data/TCGA/" # only used if streaming_from_hf is false
@@ -42,23 +42,23 @@ teacher:
   final_momentum_teacher: 1.0
   warmup_teacher_temp: 0.04
   teacher_temp: 0.07
-  warmup_teacher_temp_epochs: 10
+  warmup_teacher_temp_epochs: 10 # 30
   in_chans: 3
 optim:
-  epochs: 12 # 8000
+  epochs: 8000 
   early_stop: 200
-  lr: .0002 
+  lr: .0002
   weight_decay_end: 0.4
-  warmup_epochs: 3 # 10
+  warmup_epochs: 10 # 30
   clip_grad: 3.0
   layerwise_decay: 0.98
   patch_embed_lr_mult: 0.2
 crops:
   use_pathology_hed: true
 evaluation:
-  eval_period_iterations: 2000 # save eval ckpt every x iterations (to be used for downstream)
+  eval_period_iterations: 2500 # save eval ckpt every x iterations (to be used for downstream)
 checkpointing:
-  allow_resume: false # false means to not ever save training state (so resuming will not work)
+  allow_resume: true # false means to not ever save training state (so resuming will not work)
   period: 2500 # save training state every x iterations (to resume interrupted training runs)
   keep_every: 12500
 logging:

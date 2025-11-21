@@ -18,9 +18,9 @@ train:
   centering: sinkhorn_knopp
   eval_and_ckpt_at_step0: true
   cache_dataset: true
-  streaming_from_hf: false
+  streaming_from_hf: true
   streaming_dataset:
-    path: /data/TCGA_parquet_sample30_shuffled
+    path: medarc/TCGA-12K-parquet-shuffled
     shuffle_buffer: 50000
     base_seed: 42
   dataset_path: "pathology:root=/data/TCGA/" # only used if streaming_from_hf is false
@@ -48,9 +48,9 @@ optim:
   epochs: 8000 
   early_stop: 200
   lr: .0002
-  weight_decay_end: 0.2
+  weight_decay_end: 0.4
   warmup_epochs: 10 # 30
-  clip_grad: 30.0
+  clip_grad: 3.0
   layerwise_decay: 0.98
   patch_embed_lr_mult: 0.2
 crops:
