@@ -12,10 +12,11 @@ ibot:
 gram:
   use_loss: false # (bool) if true gram is used, else not
 train:
-  batch_size_per_gpu: 56
+  batch_size_per_gpu: 56 # 44 seems max for 1-gpu, 56 can work on full H100 node
   num_workers: 4
   OFFICIAL_EPOCH_LENGTH: 1250
   centering: sinkhorn_knopp
+  eval_and_ckpt_at_step0: true
   cache_dataset: true
   streaming_from_hf: false
   streaming_dataset:
@@ -36,20 +37,29 @@ student: # see vit_huge2 in dinov3/models/vision_transformer.py
   pos_embed_rope_rescale_coords: 2.0
   pos_embed_rope_dtype: fp32
   resume_from_teacher_chkpt: ./checkpoints/dinov3_vith16plus_saved_teacher.pth
+teacher:
+  momentum_teacher: 0.992
+  final_momentum_teacher: 1.0
+  warmup_teacher_temp: 0.04
+  teacher_temp: 0.07
+  warmup_teacher_temp_epochs: 10 # 30
+  in_chans: 3
 optim:
-  epochs: 40 # 1000
-  early_stop: 9999
+  epochs: 8000 
+  early_stop: 200
   lr: .0002
   weight_decay_end: 0.2
-  warmup_epochs: 2 # 10
+  warmup_epochs: 10 # 30
   clip_grad: 30.0
   layerwise_decay: 0.98
+  patch_embed_lr_mult: 0.2
 crops:
   use_pathology_hed: true
 evaluation:
-  eval_period_iterations: 1250 # save eval ckpt every x iterations (to be used for downstream)
+  eval_period_iterations: 2500 # save eval ckpt every x iterations (to be used for downstream)
 checkpointing:
-  period: 1250 # save training state every x iterations (to resume interrupted training runs)
+  allow_resume: true # false means to not ever save training state (so resuming will not work)
+  period: 2500 # save training state every x iterations (to resume interrupted training runs)
   keep_every: 12500
 logging:
   use_wandb: true

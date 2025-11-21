@@ -186,6 +186,7 @@ evaluation:
     high_freq: benchmark_high_frequency.yaml  # More often
     low_freq: benchmark_low_frequency.yaml  # Less often
 checkpointing:
+  allow_resume: true
   period: 3750
   max_to_keep: 3
   keep_every: 99999999999999999  # Save a checkpoint every N iterations, regardless of max_to_keep and period
