@@ -86,7 +86,7 @@ If you disable `train.streaming_from_hf`, you will need to first locally downloa
 
 We are working on a YAML config to support an informative, short training run on a single GPU that can be completed in under 12 hours. We hope this can be particularly useful for debugging and ablation experiments.
 
-The current `run_short_1gpu.sh` uses `dinov3/configs/train/vith16plus_1gpu.yaml`, which is the same as the single node 8-GPU YAML but with batch size lowered to 44, epochs lowered to 20, warmup_epochs lowered to 5, no early stopping, and FSDPCheckpointing disabled (so resuming an interrupted run will not work). It takes around 2 hours to run on 1 H100.
+The current `run_1gpu.sh` uses `dinov3/configs/train/vith16plus_1gpu.yaml`, which is the same as the single node 8-GPU YAML but with batch size lowered to 44, epochs lowered to 20, warmup_epochs lowered to 5, no early stopping, and FSDPCheckpointing disabled (so resuming an interrupted run will not work). It takes around 2 hours to run on 1 H100.
 
 ## Training Single Node, Multi‑GPU (Full Run)
 
