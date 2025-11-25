@@ -2,20 +2,21 @@
 set -euo pipefail
 
 export MASTER_ADDR=$(hostname -I | awk '{print $1}')
-export MASTER_PORT=29501
+export MASTER_PORT=30001
 
 export NNODES=1
-export NPROC_PER_NODE=4
-export CUDA_VISIBLE_DEVICES="0,1,2,3"
+export NPROC_PER_NODE=1
+export CUDA_VISIBLE_DEVICES="0"
 export NODE_RANK=0
 
 CONFIG_FILE="./dinov3/configs/train/vith16plus.yaml"
-OUTPUT_DIR="./output_vith16plus_4gpu"
+OUTPUT_DIR="./output_vith16plus_1gpu"
 RESUME="False"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 export DINOV3_RUN_SCRIPT="${REPO_ROOT}/$(basename "${BASH_SOURCE[0]}")"
 export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
+export PATH="$HOME/.local/bin:$PATH"
 
 if [[ "${RESUME}" == "True" ]]; then
   echo "Resume enabled; preserving ${OUTPUT_DIR}"

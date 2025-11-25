@@ -403,6 +403,12 @@ def do_test(cfg, model, iteration, process_group, do_low_freq=False):
     if not distributed.is_main_process():
         return
 
+    repo_root = Path(__file__).resolve().parents[2]
+    bach_root = repo_root / "eva-probe" / "data" / "bach"
+    if not bach_root.is_dir():
+        logger.info("Skipping BACH eval; dataset path missing: %s", bach_root)
+        return
+
     teacher = build_model_for_eval(cfg, str(ckpt_path))
     teacher.eval()
     teacher.requires_grad_(False)
@@ -484,10 +490,8 @@ def do_test(cfg, model, iteration, process_group, do_low_freq=False):
         std=[0.229, 0.224, 0.225],
     )
 
-    bach_root = "/home/paul/dinov3/eva-probe/data/bach"
-
-    train_ds = _BACHDataset(root=bach_root, split="train", transform=transform)
-    val_ds = _BACHDataset(root=bach_root, split="val", transform=transform)
+    train_ds = _BACHDataset(root=str(bach_root), split="train", transform=transform)
+    val_ds = _BACHDataset(root=str(bach_root), split="val", transform=transform)
 
     predict_batch_size = 64
     num_workers = 4
@@ -532,7 +536,7 @@ def do_test(cfg, model, iteration, process_group, do_low_freq=False):
         drop_last=False,
     )
 
-    max_steps = 4000 # eva originally uses 12500 steps with patience-based early stopping
+    max_steps = 12500 # eva originally uses 12500 steps with patience-based early stopping
     steps = 0
     head.train()
     with tqdm(total=max_steps) as pbar:
@@ -715,8 +719,10 @@ def build_multi_resolution_data_loader_from_cfg(
 def do_train(cfg, model, resume=False):
     global wandb_module, wandb_run
     process_subgroup = distributed.get_process_subgroup()
+    allow_resume = bool(getattr(cfg.checkpointing, "allow_resume", True))
     ckpt_dir = Path(cfg.train.output_dir, "ckpt").expanduser()
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    if allow_resume:
+        ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     model.train()
     optimizer = build_optimizer(cfg, model.get_params_groups())
@@ -734,7 +740,8 @@ def do_train(cfg, model, resume=False):
         )
     model.init_weights()
     start_iter = 0
-    if resume and (last_checkpoint_dir := find_latest_checkpoint(ckpt_dir)):
+    resume_from_checkpoint = resume and allow_resume
+    if resume_from_checkpoint and (last_checkpoint_dir := find_latest_checkpoint(ckpt_dir)):
         logger.info(f"Checkpoint found {last_checkpoint_dir}")
         start_iter = (
             load_checkpoint(
@@ -826,7 +833,7 @@ def do_train(cfg, model, resume=False):
             data_loader,
             print_freq=10,
             header="Training",
-            n_iterations=stop_iter + 1, # needed or else final ckpt won't be saved
+            n_iterations=stop_iter + 1, # needed or else final ckpt won't be saved when enabled
             start_iteration=start_iter,
         ):
             if iteration >= stop_iter:
@@ -926,11 +933,15 @@ def do_train(cfg, model, resume=False):
                     wandb_log[f"train/{key}"] = value.item() if isinstance(value, torch.Tensor) else float(value)
                 wandb_module.log(wandb_log, step=iteration)
 
-            if iteration % cfg.evaluation.eval_period_iterations == 0:
+            if iteration % cfg.evaluation.eval_period_iterations == 0 and (iteration > 0 or cfg.train.eval_and_ckpt_at_step0):
                 do_test(cfg, model, f"training_{iteration}", process_group=process_subgroup)
                 torch.cuda.synchronize()
 
-            if iteration % cfg.checkpointing.period == 0:
+            if (
+                allow_resume
+                and iteration % cfg.checkpointing.period == 0
+                and (iteration > 0 or cfg.train.eval_and_ckpt_at_step0)
+            ):
                 torch.cuda.synchronize()
                 save_checkpoint(
                     ckpt_dir / str(iteration),
