@@ -43,6 +43,13 @@ ibot:
   head_norm_last_layer: false
   head_nlayers: 3
   head_hidden_dim: 2048
+cplearn:
+  enabled: false
+  loss_weight: 1.0
+  beta: 0.2
+  proj_hidden_dim: 2048
+  proj_output_dim: 16384
+  epsilon: 1.0e-06
 gram:
   use_loss: false # (bool) if true gram is used, else not
   compute_stats: false # (bool): if true compute auxilliary stats

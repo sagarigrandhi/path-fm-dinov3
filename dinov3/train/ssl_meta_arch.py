@@ -17,6 +17,7 @@ from dinov3.configs import get_default_config
 from dinov3.data import DataAugmentationDINO
 from dinov3.fsdp.ac_compile_parallelize import ac_compile_parallelize
 from dinov3.layers.dino_head import DINOHead
+from dinov3.layers.cplearn_projector import CPLearnProjector
 from dinov3.loss import DINOLoss, GramLoss, KDELoss, KoLeoLoss, KoLeoLossDistributed, iBOTPatchLoss
 from dinov3.models import build_model_from_cfg
 from dinov3.train.cosine_lr_scheduler import linear_warmup_cosine_decay
@@ -129,6 +130,31 @@ class SSLMetaArch(nn.Module):
         student_model_dict["ibot_head"] = ibot_head_class()
         teacher_model_dict["ibot_head"] = ibot_head_class()
         self.ibot_patch_loss = iBOTPatchLoss(cfg.ibot.head_n_prototypes)
+
+        self.cplearn_cfg = getattr(cfg, "cplearn", None)
+        self.cplearn_enabled = bool(self.cplearn_cfg and self.cplearn_cfg.enabled)
+        if self.cplearn_enabled:
+            logger.info("OPTIONS -- CPLearn")
+            logger.info(f"OPTIONS -- CPLearn -- loss_weight: {self.cplearn_cfg.loss_weight}")
+            logger.info(f"OPTIONS -- CPLearn -- proj_hidden_dim: {self.cplearn_cfg.proj_hidden_dim}")
+            logger.info(f"OPTIONS -- CPLearn -- proj_output_dim: {self.cplearn_cfg.proj_output_dim}")
+            student_model_dict["cplearn_projector"] = CPLearnProjector(
+                embed_dim,
+                hidden_dim=self.cplearn_cfg.proj_hidden_dim,
+                proj_dim=self.cplearn_cfg.proj_output_dim,
+                epsilon=self.cplearn_cfg.epsilon,
+            )
+            teacher_model_dict["cplearn_projector"] = CPLearnProjector(
+                embed_dim,
+                hidden_dim=self.cplearn_cfg.proj_hidden_dim,
+                proj_dim=self.cplearn_cfg.proj_output_dim,
+                epsilon=self.cplearn_cfg.epsilon,
+            )
+            self.cplearn_loss_weight = self.cplearn_cfg.loss_weight
+            self.cplearn_beta = self.cplearn_cfg.beta
+        else:
+            self.cplearn_loss_weight = 0.0
+            self.cplearn_beta = 0.0
 
         # Build student and teacher models
         self.student = nn.ModuleDict(student_model_dict)
@@ -304,6 +330,8 @@ class SSLMetaArch(nn.Module):
         self.student.dino_head.init_weights()
         self.student.ibot_head.init_weights()
         self.dino_loss.init_weights()
+        if self.cplearn_enabled:
+            self.student.cplearn_projector.reset_parameters()
         self.ibot_patch_loss.init_weights()
         self.model_ema.load_state_dict(self.student.state_dict())
         if self.has_gram_teacher:
@@ -334,6 +362,7 @@ class SSLMetaArch(nn.Module):
                 skip_load_keys=["dino_loss.center", "ibot_patch_loss.center"],
                 keys_not_sharded=["backbone.rope_embed.periods", "qkv.bias_mask"],
                 process_group=distributed.get_process_subgroup(),
+                strict=not self.cplearn_enabled, #while CPLearn is enabled
             )
             self.model_ema.load_state_dict(self.student.state_dict())
         if self.cfg.distillation.enabled:
@@ -654,6 +683,9 @@ class SSLMetaArch(nn.Module):
         )
         loss_dict["ibot_loss"] = ibot_patch_loss
         loss_accumulator += self.ibot_loss_weight * ibot_patch_loss
+
+        # CPlearn loss
+        
 
         # Gram loss
         if self.gram_use_loss:
